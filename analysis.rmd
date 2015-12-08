@@ -1,0 +1,180 @@
+---
+title: "Techniques"
+date: "December 5, 2015"
+output: word_document
+---
+## Preparation
+Here I do some analysis on the model used for tea recommendations. 
+Note that this is an R Markdown document -- it interweaves markdown (a typesetting language) with R (a statistical programming language). It is easy to view and execute using RStudio (an IDE for R). 
+
+Note that the document has been edited for grammar and formatting (so the rmd file may not precisely match the content of the document). 
+
+I'm going to source my functions and write an additional logging function.
+```{r}
+source('functions.R')
+library(ggplot2)
+library(scales)
+library(AUC)
+
+getAuc <- function(num.prediction, int.actual) {
+  auc(roc(num.prediction, factor(int.actual)))
+}
+
+logNote <- function(...) do.call(cat, c(list(as.character(Sys.time()), ': '), list(...), list('\n', sep = '')))
+```
+
+Now, pull in the data and use my function to perform the initial calculations
+```{r}
+lst.data <- getData(log.cached = TRUE)
+dt.data <- combineData(lst.data)
+mat.similarity <- computeDistanceMatrix(dt.data)
+dt.similarity <- getSimilarityTable(mat.similarity)
+```
+
+To calculate performance, I'm going to pull out the review data (from whichever vendors provide such data) and use that as my test set. Essentially the model is supervised, but I'm building a new model for each person.
+
+```{r}
+dt.reviews <- rbindlist(lapply(lst.data, function(x) {
+  if('review' %in% names(x)) {
+    dt.reviews <- rbindlist(lapply(1:nrow(x), function(y) {
+      mxt.review <- x[y, review][[1]]
+      if(is.data.table(mxt.review)) {
+        mxt.review <- cbind(mxt.review, url = x[y, link], vendor = x[y, vendor])
+        return(mxt.review)
+      } else {
+        return(NULL)
+      }
+    }))
+  }
+}))
+# need to clean this -- these get cast as characters
+dt.reviews[, score:=as.numeric(score)] 
+```
+
+## Performance Analysis
+I expect the predictive power/accuracy will vary as a function of the training set size. Here I explicitly test various training set sizes in order to find whether/when this modeling adds value. 
+
+First, I need to restrict my review data to reviewers who have more than one review.
+``` {r}
+dt.reviews <- dt.reviews[reviewer %in% 
+                           dt.reviews[, list(n=.N),by=list(reviewer)][
+                                      n > 1, reviewer] ]
+dt.response <- dt.reviews[, list(score, reviewer, vendor, url, like = score >= median(score))]
+dt.response <- dt.response[, list(reviewer, url, like)]
+# Remove duplicates (just give me the earliest like/dislike)
+setkey(dt.response, reviewer, url)
+dt.response <- unique(dt.response)
+```
+
+Now build the training sets
+``` {r}
+num.max.training <- dt.response[, .N, reviewer][, quantile(N,0.95)] # Want reasonable # of samples
+num.rows.expected <- sum(vapply(dt.response[, .N, by=list(reviewer)][, N], 
+       function(x) {
+         sum(vapply(1:num.max.training, function(k) {
+           x * choose(x-1,k) * k
+         }, numeric(1)))
+       },
+       numeric(1)))
+dt.response[, N:=.N, by=list(reviewer)]
+dt.choose <- rbindlist(lapply(1:num.max.training, function(x) {
+  dt.response[N > x][, (function(dt) {
+    # logNote('Working on ', reviewer, ' with ', x, ' training size out of ', .N, ' possible.')
+    # Make sure I'm doing n choose k with k <= n.
+    if(.N <= x) return(data.table(
+      url_testing = character(0), 
+      training_set_size = numeric(0), 
+      url_training = character(0), 
+      like_training = logical(0), 
+      id=numeric(0)))
+    
+    # Now find all possible training sets of size x.
+    # Return as a data.table
+    lst.combn <- lapply(seq_along(dt$url), function(y) {
+
+      lst.combinations <- combn(
+        setdiff(dt$url,dt$url[y]),
+        x,
+        simplify=FALSE)
+      
+      lst.combinations <- lapply(lst.combinations, function(chr.urls) {
+        data.table(url_testing = dt$url[y], 
+                   training_set_size = x, 
+                   url_training = chr.urls, 
+                   like_training = dt[match(chr.urls, url), like])
+      })
+      lst.combinations <- lapply(seq_along(lst.combinations), function(num.id) {
+        cbind(lst.combinations[[num.id]], id = num.id)
+      })
+      dt.combn <- rbindlist(lst.combinations)
+
+      return(dt.combn[, list(
+        url_testing,
+        training_set_size = as.double(training_set_size),
+        url_training,
+        like_training,
+        id = as.double(id)
+      )])
+    })
+    dt.combn <- rbindlist(lst.combn)
+    return(dt.combn)
+  })(.SD), by=list(reviewer)]
+}))
+
+if(nrow(dt.choose) != num.rows.expected) stop('Error in building training samples -- rows didn\'t match expectations')
+
+# Use a hash to avoid repeated calculations.
+# The hash is the entire training set (each tea in the training set and whether it is liked or not)
+# Clearly I'm using a memory-infefficient but easily-reversible hashing function
+dt.choose <- dt.choose[order(url_training)]
+dt.choose[, hash:=paste0(url_training, ' ', like_training, collapse = ','), by=list(reviewer, training_set_size, id, url_testing)]
+
+dt.hash <- unique(dt.choose[, list(url_training, like_training, hash)])
+dt.hash <- dt.hash[, 
+                   recommendTea(chr.liked.teas = url_training[like_training], 
+                                url_training[!like_training], 
+                                dt.similarity), 
+                   by=list(hash)]
+dt.predict <- merge(
+                    unique(dt.choose[, list(hash, url_testing, reviewer, training_set_size, id)]), 
+                    dt.hash[, list(hash, 
+                                   url_testing = recommendation, 
+                                   likelihood, 
+                                   most_similar_tea, 
+                                   least_similar_tea, 
+                                   rank)], 
+                    by=c('hash','url_testing'))
+
+dt.predict[, hash:=NULL]
+dt.predict <- merge(dt.predict,
+                    dt.response[, list(reviewer, url_testing = url, like_testing = like)],
+                    by=c('reviewer','url_testing'))
+```
+
+Now check the performance. 
+
+Since there's a new 'model' for each person in order to predict which teas they'd like, we also wanted to see how useful it is to increase the number of teas used to train each person's model. These are the differently colored lines in the graph. 
+
+``` {r}
+dt.roc <- rbindlist(lapply(seq(min(dt.predict$likelihood),max(dt.predict$likelihood),length.out = 1000), 
+                           function(x) dt.predict[, list(training_set_size, like_prediction = likelihood >= x, like_testing)][
+                             , list(true_positive = sum(like_prediction & like_testing),
+                                    true_negative = sum(!like_prediction & !like_testing),
+                                    false_positive = sum(like_prediction & !like_testing),
+                                    false_negative = sum(!like_prediction & like_testing),
+                                    threshold = x),
+                             by=list(training_set_size)]))
+dt.roc[, false_positive_rate := false_positive / (false_positive + true_negative)]
+dt.roc[, true_positive_rate := true_positive / (true_positive + false_negative)]
+ggplot(dt.roc, aes(false_positive_rate, true_positive_rate, linetype = 'Prediction', colour = factor(training_set_size))) + 
+  geom_line() + 
+  geom_abline(slope = 1, intercept = 0, aes(linetype = 'Y=X line')) + 
+  labs(title = 'ROC Curve', colour = 'Training Set Size', x = 'False Positive Rate', y = 'True Positive Rate', linetype = 'Line') + 
+  theme_bw()
+dt.predict[, list(`Area Under the ROC Curve` = getAuc(likelihood, like_testing)), list(`Training Set Size` = training_set_size)]
+```
+
+Here we can see that our results appear to be better than a coin-flip, although not by a huge margin. Results do improve as we increase our training size. 
+
+## Conclusion
+The techniques used here are a great starting point for the business plan, allowing us to bootstrap recommendations. As an operating business, we'd in fact be able to improve our predictive abilities frequently by leveraging the proprietary data we'd gain by having users submit their own reviews, ratings, and opinions. In the same way that Google initially relied on PageRank (an algorithm applied to an essentially public data set) and has eventually moved to leverage their data on user behavior to improve results, we could initially rely on this data and eventually improve our modeling through our proprietary data.
